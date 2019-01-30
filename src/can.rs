@@ -1,17 +1,11 @@
+use crate::spc;
 use bit_field::BitField;
-
+use embedded_types;
+use embedded_types::can::{BaseID, ExtendedDataFrame, ExtendedID};
+pub use embedded_types::can::{CanFrame, ID};
+use embedded_types::io::Error as IOError;
 use s32k144;
 use s32k144::can0;
-
-use crate::spc;
-
-pub use embedded_types::can::{CanFrame, ID};
-
-use embedded_types;
-
-use embedded_types::can::{BaseID, ExtendedDataFrame, ExtendedID};
-
-use embedded_types::io::Error as IOError;
 
 const TX_MAILBOXES: usize = 8;
 const RX_MAILBOXES: usize = 8;
@@ -22,25 +16,34 @@ pub struct Can<'a> {
 }
 
 impl<'a> Can<'a> {
+    pub fn init_fd(
+        can: &'a s32k144::can0::RegisterBlock,
+        spc: &'a spc::Spc<'a>,
+        settings: &CanSettings,
+    ) -> Result<Self, CanError> {
+        // XXX: When the CAN FD feature is enabled, do not use the PRESDIV, RJW, PSEG1, PSEG2, and
+        // PROPSEG fields of the CTRL1 register for CAN bit timing. Instead use the CBT register's
+        // EPRESDIV, ERJW, EPSEG1, EPSEG2, and EPROPSEG fields.
+
+        return Ok(Can {
+            register_block: can,
+            _spc: spc,
+        });
+    }
+
     pub fn init(
         can: &'a s32k144::can0::RegisterBlock,
         spc: &'a spc::Spc<'a>,
         settings: &CanSettings,
     ) -> Result<Self, CanError> {
-        let source_frequency = {
-            match settings.clock_source {
-                ClockSource::Sys => spc.core_freq(),
-                ClockSource::Soscdiv2 => {
-                    spc.soscdiv2_freq().ok_or(CanError::ClockSourceDisabled)?
-                }
-            }
+        let source_frequency = match settings.clock_source {
+            ClockSource::Sys => spc.core_freq(),
+            ClockSource::Soscdiv2 => spc.soscdiv2_freq().ok_or(CanError::ClockSourceDisabled)?,
         };
 
-        if source_frequency % settings.can_frequency != 0 {
-            return Err(CanError::SettingsError);
-        }
-
-        if source_frequency < settings.can_frequency * 5 {
+        if source_frequency % settings.can_frequency != 0
+            || source_frequency < settings.can_frequency * 5
+        {
             return Err(CanError::SettingsError);
         }
 
@@ -74,39 +77,40 @@ impl<'a> Can<'a> {
         enable(can);
         enter_freeze(can);
 
+        #[rustfmt::skip]
         can.mcr.modify(|_, w| {
-            w.rfen()
-                .bit(false)
-                .srxdis()
-                .bit(!settings.self_reception)
-                .irmq()
-                .bit(settings.individual_masking)
-                .aen()
-                .bit(true)
-                .dma()
-                .bit(false);
+            w.rfen().bit(settings.rx_fifo)
+                .srxdis().bit(!settings.self_reception)
+                .irmq().bit(settings.individual_masking)
+                .aen().bit(true)
+                .dma().bit(settings.rx_fifo && false);
             unsafe { w.maxmb().bits((RX_MAILBOXES + TX_MAILBOXES) as u8 - 1) };
             w
         });
 
+        #[rustfmt::skip]
         can.ctrl1.modify(|_, w| unsafe {
-            w.presdiv()
-                .bits(presdiv as u8)
-                .pseg1()
-                .bits(pseg1 as u8)
-                .pseg2()
-                .bits(pseg2 as u8)
-                .propseg()
-                .bits(propseg as u8)
-                .rjw()
-                .bits(rjw as u8)
-                .lpb()
-                .bit(settings.loopback_mode)
+            // Prescaler division factor
+            w.presdiv().bits(presdiv as u8)
+                // Phase segment 1
+                .pseg1().bits(pseg1 as u8)
+                // Phase segment 2
+                .pseg2().bits(pseg2 as u8)
+                // Propagation segment
+                .propseg().bits(propseg as u8)
+                // Resync jump width
+                .rjw().bits(rjw as u8)
+                // Loop back mode
+                .lpb().bit(settings.loopback_mode)
         });
+
+        if settings.loopback_mode {
+            can.fdctrl.modify(|_, w| w.tdcen()._0());
+        }
 
         // set filter mask to accept all
         // TODO: Make better logic for setting filters
-        can.rxmgmask.write(unsafe { |w| w.bits(0) });
+        can.rxmgmask.write(|w| unsafe { w.bits(0) });
 
         /*
         • Initialize the Message Buffers
@@ -230,6 +234,17 @@ pub struct CanSettings {
     /// the frame reception.
     pub self_reception: bool,
 
+    /// This bit controls whether the Rx FIFO feature is enabled or not. When RFEN is set, MBs 0 to
+    /// 5 cannotbe used for normal reception and transmission because the corresponding memory
+    /// region (0x80-0xDC) is used by the FIFO engine as well as additional MBs (up to 32,
+    /// depending on `CTRL2[RFFN]` setting) which are used as Rx FIFO ID filter table elements.
+    /// `RFEN` also impacts the definition of the minimum numbers of peripheral clocks per CAN bit
+    /// as described in Table 55-31. This bit can be written in Freeze mode only, because it is
+    /// blocked by hardware in other modes.
+    ///
+    /// This bit cannot be set when CAN FG operation is enabled (see `FDEN` bit).
+    pub rx_fifo: bool,
+
     /// This bit indicates whether Rx matching process will be based either on individual masking and queue or
     /// on masking scheme with CAN_RXMGMASK, CAN_RX14MASK, CAN_RX15MASK and
     /// CAN_RXFGMASK.
@@ -255,6 +270,7 @@ impl Default for CanSettings {
         CanSettings {
             warning_interrupt: false,
             self_reception: true,
+            rx_fifo: false,
             individual_masking: false,
             loopback_mode: false,
             can_frequency: 1000000,
@@ -452,24 +468,46 @@ impl MailboxHeader {
 
 fn enable(can: &can0::RegisterBlock) {
     can.mcr.modify(|_, w| w.mdis()._0());
+
+    // Wait until the module has been enabled
     while can.mcr.read().lpmack().is_1() {}
 }
 
-fn reset(can: &can0::RegisterBlock) {
+fn disable(can: &can0::RegisterBlock) {
     can.mcr.modify(|_, w| w.mdis()._1());
+
+    // Wait until module has entered low power mode. Effectively waits until all current
+    // transmissions or reception processes have finished, and asserts that the module is disabled.
     while can.mcr.read().lpmack().is_0() {}
+}
+
+fn reset(can: &can0::RegisterBlock) {
+    disable(can);
+
+    // Set peripheral clock as clock source
+    // TODO: remove this?
     can.ctrl1.modify(|_, w| w.clksrc()._1());
-    can.mcr.modify(|_, w| w.mdis()._0());
-    while can.mcr.read().lpmack().is_1() {}
+
+    // TODO: do we need this?
+    enable(can);
+
+    // Soft reset; resets FlexCAN-internal state machines and some memory-mapped registers.
     can.mcr.modify(|_, w| w.softrst()._1());
     while can.mcr.read().softrst().is_1() {}
-    can.mcr.modify(|_, w| w.mdis()._1());
-    while can.mcr.read().lpmack().is_0() {}
+
+    disable(can);
 }
 
 fn enter_freeze(can: &can0::RegisterBlock) {
     can.mcr.modify(|_, w| w.frz()._1().halt()._1());
-    while can.mcr.read().frzack().is_0() {}
+    // TODO: Check whether CAN_MCR[MDIS] (Module Disable) is set to 1. If it is, clear it to 0.
+    // Done in `enable()`. Panic if it is 1 here?
+    while can.mcr.read().frzack().is_0() {
+        // TODO: panic if timeout reached (for now).
+        //
+        // TODO: poll until timeout (ref. p. 1638) is reached.
+        // More steps needed if timeout reached.
+    }
 }
 
 fn leave_freeze(can: &can0::RegisterBlock) {

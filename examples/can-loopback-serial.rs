@@ -7,13 +7,9 @@ extern crate s32k144;
 extern crate s32k144evb;
 
 use cortex_m_rt::entry;
-
 use s32k144evb::{can, spc, wdog};
-
 use s32k144evb::pcc::Pcc;
-
 use s32k144evb::can::{CanSettings, ID};
-
 use embedded_types::can::{BaseID, DataFrame};
 
 #[entry]
@@ -21,12 +17,10 @@ fn main() -> ! {
     let peripherals = s32k144::Peripherals::take().unwrap();
 
     let wdog_settings = wdog::WatchdogSettings {
-        //timeout_value: 0xffff,
         enable: false,
         ..Default::default()
     };
-    let wdog = wdog::Watchdog::init(&peripherals.WDOG, wdog_settings).unwrap();
-    wdog.reset();
+    let _wdog = wdog::Watchdog::init(&peripherals.WDOG, wdog_settings).unwrap();
 
     let spc_config = spc::Config {
         system_oscillator: spc::SystemOscillatorInput::Crystal(8_000_000),
@@ -42,8 +36,11 @@ fn main() -> ! {
     )
     .unwrap();
 
-    let mut can_settings = CanSettings::default();
-    can_settings.self_reception = false;
+    let can_settings = CanSettings {
+        self_reception: true,
+        loopback_mode: true,
+        ..Default::default()
+    };
 
     // Enable and configure the system oscillator
     let pcc = Pcc::init(&peripherals.PCC);
@@ -67,11 +64,7 @@ fn main() -> ! {
             }
             for i in 0..loop_max {
                 if i == 0 {
-                    let _notrdy = peripherals.CAN0.mcr.read().notrdy().bit();
                     can.transmit(&message.into()).unwrap();
-                }
-                if i & 1000 == 0 {
-                    wdog.reset();
                 }
             }
         }
